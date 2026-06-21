@@ -270,8 +270,8 @@
         <datalist id="empDatalist"></datalist>
         <div class="row">
           <input type="date" id="manualDate" style="margin:0;">
-          <input type="time" step="1" id="manualIn" placeholder="Entrata" style="margin:0;">
-          <input type="time" step="1" id="manualOut" placeholder="Uscita (opzionale)" style="margin:0;">
+          <input type="time" id="manualIn" placeholder="Entrata" style="margin:0;">
+          <input type="time" id="manualOut" placeholder="Uscita (opzionale)" style="margin:0;">
         </div>
         <div class="row" style="margin-top:10px;">
           <button class="green" id="btnSaveManual">Salva timbratura</button>
@@ -457,7 +457,7 @@ setInterval(()=>{ if(navigator.onLine) flushQueue(); }, 30000);
 
 
 function todayStr(){ return new Date().toISOString().slice(0,10); }
-function nowStr(){ return new Date().toTimeString().slice(0,8); }
+function nowStr(){ return new Date().toTimeString().slice(0,5); }
 function fmtDate(d){
   const [y,m,day] = d.split('-');
   return day+'/'+m+'/'+y;
@@ -635,8 +635,7 @@ document.getElementById('btnSaveManual').addEventListener('click', async ()=>{
   if(!date){ errEl.textContent = 'Seleziona una data.'; return; }
   if(!inTime){ errEl.textContent = "Inserisci almeno l'orario di entrata."; return; }
 
-  inTime = inTime.length===5 ? inTime+':00' : inTime;
-  outTime = outTime ? (outTime.length===5 ? outTime+':00' : outTime) : '';
+  // manteniamo solo ore:minuti, senza secondi
 
   const entryId = 'local-'+Date.now()+'-'+Math.random().toString(36).slice(2,7);
   const entry = {id: entryId, date, matricola, nome, in: inTime, out: outTime, manual:true, _pending: !!getSheetsUrl()};
@@ -697,8 +696,8 @@ function renderLog(){
     const tr = document.createElement('tr');
     if(r.idx === editingIdx){
       tr.innerHTML = '<td>'+r.nome+'</td><td>'+r.matricola+'</td><td>'+fmtDate(r.date)+'</td>'
-        +'<td><input type="time" step="1" id="editIn" value="'+(r.in||'')+'" style="margin:0;padding:6px;font-size:13px;"></td>'
-        +'<td><input type="time" step="1" id="editOut" value="'+(r.out||'')+'" style="margin:0;padding:6px;font-size:13px;"></td>'
+        +'<td><input type="time" id="editIn" value="'+(r.in||'')+'" style="margin:0;padding:6px;font-size:13px;"></td>'
+        +'<td><input type="time" id="editOut" value="'+(r.out||'')+'" style="margin:0;padding:6px;font-size:13px;"></td>'
         +'<td style="white-space:nowrap;"><button class="delBtn" id="saveEditBtn" style="color:var(--accent);border-color:var(--accent);" data-idx="'+r.idx+'">Salva</button> '
         +'<button class="delBtn" id="cancelEditBtn">Annulla</button></td>';
     } else {
@@ -781,8 +780,9 @@ async function saveLogEdit(idx){
     return;
   }
   const entry = log[idx];
-  entry.in = newIn.length===5 ? newIn+':00' : newIn;
-  entry.out = newOut ? (newOut.length===5 ? newOut+':00' : newOut) : '';
+  // manteniamo solo ore:minuti, senza secondi
+  entry.in = newIn;
+  entry.out = newOut || '';
   editingIdx = null;
   saveLocalCache();
   renderLog();
@@ -875,16 +875,33 @@ document.getElementById('btnExportXlsx').addEventListener('click', ()=>{
   const rows = dateFilteredLogForExport();
   const data = [['Nominativo','Matricola','Data','Orario Ingresso','Orario Uscita']];
   rows.forEach(r=>{
-    data.push([r.nome, r.matricola, fmtDate(r.date), r.in||'', r.out||'']);
+    data.push([r.nome, r.matricola, r.date, r.in||'', r.out||'']);
   });
   const ws = XLSX.utils.aoa_to_sheet(data);
 
-  // Converte Ingresso/Uscita in VERI valori orari Excel (non testo), così
-  // le formule (es. calcolo ore lavorate) funzionano anche copiando i
-  // dati in un altro foglio. La Data resta testo in formato dd/mm/aaaa.
+  // Converte Data/Ingresso/Uscita in VERI valori data/ora Excel (non testo),
+  // così le formule (es. calcolo ore lavorate, confronto/CERCA per data)
+  // funzionano anche copiando i dati in un altro foglio. La Data viene
+  // comunque MOSTRATA come dd/mm/aaaa grazie al formato applicato qui sotto.
+  // La Matricola viene scritta come VERO NUMERO (non testo): se nell'altro
+  // foglio la matricola è anch'essa un numero, CERCA.VERT/VLOOKUP funziona
+  // correttamente — testo e numero non vengono mai considerati uguali da
+  // Excel anche se sembrano identici a vista (es. "62620" testo ≠ 62620 numero).
   for(let i=0; i<rows.length; i++){
     const r = rows[i];
     const rowIdx = i + 1; // riga 0 = intestazione
+
+    if(r.date){
+      const [y,mo,d] = r.date.split('-').map(Number);
+      const dateAddr = XLSX.utils.encode_cell({r: rowIdx, c: 2});
+      ws[dateAddr] = {t:'d', v: new Date(y, mo-1, d), z:'dd/mm/yyyy'};
+    }
+
+    const matNum = Number(r.matricola);
+    if(r.matricola !== '' && !isNaN(matNum)){
+      const matAddr = XLSX.utils.encode_cell({r: rowIdx, c: 1});
+      ws[matAddr] = {t:'n', v: matNum, z:'0'};
+    }
 
     const inFrac = excelTimeFraction(r.in);
     if(inFrac !== null){
@@ -970,7 +987,7 @@ function updateLiveClock(){
   const el = document.getElementById('liveClock');
   const dateEl = document.getElementById('liveDate');
   const now = new Date();
-  if(el) el.textContent = nowStr();
+  if(el) el.textContent = now.toTimeString().slice(0,8); // orologio a schermo: con i secondi, solo visivo
   if(dateEl) dateEl.textContent = GIORNI[now.getDay()] + ' ' + now.getDate() + ' ' + MESI[now.getMonth()];
 }
 setInterval(updateLiveClock, 1000);
