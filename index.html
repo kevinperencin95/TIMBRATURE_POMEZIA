@@ -261,6 +261,7 @@
           <button class="ghost small" id="btnExportCsv">Esporta CSV (Google Sheets)</button>
         </div>
       </div>
+      <div class="hint" id="logSummary" style="margin-bottom:14px;font-weight:700;color:var(--brand-deep);"></div>
       <button class="ghost" id="btnShowManual" style="width:100%;margin-bottom:14px;">+ Aggiungi timbratura manuale</button>
 
       <div id="manualForm" style="display:none;margin-bottom:18px;padding:16px;background:var(--card2);border:1px dashed var(--line);border-radius:14px;">
@@ -676,9 +677,18 @@ let editingIdx = null;
 function renderLog(){
   const filterDate = document.getElementById('filterDate').value;
   const tbody = document.querySelector('#logTable tbody');
+  const summaryEl = document.getElementById('logSummary');
   tbody.innerHTML='';
   let rows = log.map((r,i)=>({...r, idx:i})).sort((a,b)=> (b.date+b.in).localeCompare(a.date+a.in));
   if(filterDate) rows = rows.filter(r=>r.date===filterDate);
+
+  const uniqueEmp = new Set(rows.map(r=>r.matricola)).size;
+  if(filterDate){
+    summaryEl.textContent = uniqueEmp + (uniqueEmp===1 ? ' dipendente ha timbrato' : ' dipendenti hanno timbrato') + ' il ' + fmtDate(filterDate) + ' (' + rows.length + ' timbrature)';
+  } else {
+    summaryEl.textContent = uniqueEmp + (uniqueEmp===1 ? ' dipendente' : ' dipendenti') + ' nel registro completo (' + rows.length + ' timbrature)';
+  }
+
   if(rows.length===0){
     tbody.innerHTML = '<tr><td colspan="6" class="empty">Nessuna timbratura trovata</td></tr>';
     return;
