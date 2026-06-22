@@ -1008,6 +1008,18 @@ window.addEventListener('online', updateConnPill);
 window.addEventListener('offline', updateConnPill);
 updateConnPill();
 
+// ===== WAKE LOCK: mantiene lo schermo sempre acceso finché l'app è aperta =====
+// Usa la Screen Wake Lock API nativa del browser (supportata da Chrome/Edge su
+// Android e PC). Se il dispositivo non la supporta, viene ignorata silenziosamente.
+let wakeLock = null;
+async function acquireWakeLock(){
+  if(!('wakeLock' in navigator)) return;
+  try{
+    wakeLock = await navigator.wakeLock.request('screen');
+  }catch(err){}
+}
+acquireWakeLock();
+
 // Salvataggio extra di sicurezza prima che la pagina venga chiusa o si spenga il dispositivo
 window.addEventListener('beforeunload', ()=>{
   try{ localStorage.setItem(STORE_KEY_LOG, JSON.stringify(log)); }catch(e){}
@@ -1017,6 +1029,11 @@ window.addEventListener('visibilitychange', ()=>{
   if(document.visibilityState === 'hidden'){
     try{ localStorage.setItem(STORE_KEY_LOG, JSON.stringify(log)); }catch(e){}
     try{ localStorage.setItem(STORE_KEY_EMP, JSON.stringify(employees)); }catch(e){}
+  } else {
+    // L'app è tornata in primo piano: riacquisiamo il wake lock perché
+    // viene rilasciato automaticamente dal browser quando la pagina
+    // va in background (es. utente apre un'altra app e poi torna qui).
+    acquireWakeLock();
   }
 });
 
