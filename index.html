@@ -158,6 +158,16 @@
   .toolbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;flex-wrap:wrap;gap:8px;}
   .small{font-size:12px;padding:9px 13px;}
   .delBtn{background:transparent;border:1px solid var(--line);color:var(--stop);padding:5px 10px;font-size:11.5px;font-weight:700;border-radius:8px;}
+  th.sortable{cursor:pointer;user-select:none;white-space:nowrap;}
+  th.sortable:hover{color:var(--brand);}
+  .sort-icon{font-size:11px;margin-left:3px;opacity:.5;}
+  th.sort-asc .sort-icon{opacity:1;}
+  th.sort-desc .sort-icon{opacity:1;}
+  .sync-badge{display:inline-flex;align-items:center;gap:4px;padding:3px 9px;border-radius:20px;
+    font-size:11px;font-weight:700;white-space:nowrap;}
+  .sync-badge.cloud{background:rgba(31,123,184,.1);color:var(--brand-deep);}
+  .sync-badge.local{background:rgba(232,169,58,.15);color:#9a6e00;}
+  .sync-badge.syncing{background:rgba(91,118,145,.1);color:var(--muted);}
 
   /* ---------- Recent timeline ---------- */
   .recent{margin-top:6px;text-align:left;}
@@ -282,7 +292,15 @@
 
       <div style="overflow-x:auto;">
         <table id="logTable">
-          <thead><tr><th>Nominativo</th><th>Matricola</th><th>Data</th><th>Entrata</th><th>Uscita</th><th></th></tr></thead>
+          <thead><tr>
+            <th class="sortable" data-col="nome">Nominativo <span class="sort-icon" id="sort-nome"></span></th>
+            <th>Matricola</th>
+            <th class="sortable" data-col="date">Data <span class="sort-icon" id="sort-date"></span></th>
+            <th class="sortable" data-col="in">Entrata <span class="sort-icon" id="sort-in"></span></th>
+            <th class="sortable" data-col="out">Uscita <span class="sort-icon" id="sort-out"></span></th>
+            <th title="Stato sincronizzazione">Sync</th>
+            <th></th>
+          </tr></thead>
           <tbody></tbody>
         </table>
       </div>
@@ -434,26 +452,100 @@ async function loadData(){
   }
 }
 
+// ===== SINCRONIZZAZIONE ROBUSTA CON DEDUPLICAZIONE =====
+let isFlushing = false;
+
+async function isConnectionStable(){
+  const url = getSheetsUrl();
+  if(!url || !navigator.onLine) return false;
+  let successes = 0;
+  for(let i=0; i<2; i++){
+    try{
+      const ctrl = new AbortController();
+      const timer = setTimeout(()=>ctrl.abort(), 4000);
+      const res = await fetch(url, {method:'GET', signal: ctrl.signal});
+      clearTimeout(timer);
+      if(res.ok) successes++;
+      else break;
+    }catch(e){ break; }
+    if(i===0) await new Promise(r=>setTimeout(r,1500));
+  }
+  return successes >= 2;
+}
+
+function deduplicateQueue(remoteLog){
+  if(!remoteLog || !remoteLog.length) return;
+  pendingQueue = pendingQueue.filter(item=>{
+    if(item.action !== 'scan' && item.action !== 'addLog') return true;
+    const mat = item.payload.matricola;
+    const date = item.payload.date || todayStr();
+    const inTime = item.payload.in;
+    const alreadyThere = remoteLog.some(r =>
+      r.matricola === mat &&
+      r.date === date &&
+      (inTime ? r.in === inTime : true)
+    );
+    return !alreadyThere;
+  });
+}
+
 async function flushQueue(){
+  if(isFlushing) return;
   if(pendingQueue.length===0) return;
   const url = getSheetsUrl();
   if(!url) return;
+
+  const stable = await isConnectionStable();
+  if(!stable){
+    console.log('Connessione instabile, invio posticipato');
+    return;
+  }
+
+  try{
+    const res = await fetch(url, {method:'GET'});
+    if(res.ok){
+      const remote = await res.json();
+      deduplicateQueue(remote.log || []);
+      if(remote.log) log = [...(remote.log), ...log.filter(r=>r._pending)];
+      saveLocalCache();
+    }
+  }catch(e){}
+
+  if(pendingQueue.length===0){
+    renderLog(); renderRecent();
+    return;
+  }
+
+  isFlushing = true;
+  const wasPending = pendingQueue.length;
   const remaining = [];
   for(const item of pendingQueue){
-    const res = await postToSheet(item.action, item.payload);
-    if(!res.ok){
+    try{
+      const res = await postToSheet(item.action, item.payload);
+      if(!res.ok && !res.offline){
+        console.warn('Invio fallito definitivamente:', item.action, res.error);
+      } else if(res.offline){
+        remaining.push(item);
+      }
+    }catch(e){
       remaining.push(item);
     }
   }
   pendingQueue = remaining;
+  isFlushing = false;
   saveLocalCache();
-  if(remaining.length === 0){
+
+  if(remaining.length < wasPending){
     await fetchFromSheet();
     renderEmployees(); renderLog(); renderRecent();
   }
 }
-window.addEventListener('online', ()=>{ updateConnPill(); flushQueue(); });
-setInterval(()=>{ if(navigator.onLine) flushQueue(); }, 30000);
+
+window.addEventListener('online', ()=>{
+  updateConnPill();
+  setTimeout(flushQueue, 3000);
+});
+setInterval(()=>{ if(navigator.onLine && !isFlushing) flushQueue(); }, 30000);
 
 
 function todayStr(){ return new Date().toISOString().slice(0,10); }
@@ -482,7 +574,8 @@ function showOverlay(name, detail, kind){
 // Evita doppie timbrature se lo stesso badge viene letto due volte di fila
 // (es. lettore che invia il codice due volte, o scansione accidentale ripetuta)
 let lastScan = {matricola:'', time:0};
-const DOUBLE_SCAN_WINDOW_MS = 4000;
+const DOUBLE_SCAN_MS = 4000;        // blocco assoluto entro 4 secondi (lettore che sparava doppio)
+const BLOCK_WINDOW_MS = 15 * 60 * 1000; // blocco automatico entro 15 minuti
 
 async function registerScan(matricola){
   matricola = matricola.trim();
@@ -495,15 +588,60 @@ async function registerScan(matricola){
   }
 
   const now = Date.now();
-  if(matricola === lastScan.matricola && (now - lastScan.time) < DOUBLE_SCAN_WINDOW_MS){
-    showOverlay(nome, 'Timbratura già registrata pochi secondi fa, ignorata per evitare un doppione.', 'error');
+
+  // --- Blocco 1: stessa matricola entro 4 secondi (lettore che la legge doppio) ---
+  if(matricola === lastScan.matricola && (now - lastScan.time) < DOUBLE_SCAN_MS){
+    showOverlay(nome, 'Scansione duplicata ignorata (troppo ravvicinata).', 'error');
     return;
   }
+
+  const today = todayStr();
+
+  // --- Blocco 2: già timbrato entro gli ultimi 15 minuti ---
+  const recentEntry = log.filter(r => r.date === today && r.matricola === matricola)
+    .sort((a,b) => (b.in||'').localeCompare(a.in||''))
+    .find(r => {
+      const lastTime = r.out || r.in;
+      if(!lastTime) return false;
+      const [hh,mm] = lastTime.split(':').map(Number);
+      const nowDate = new Date();
+      const entryMs = new Date(nowDate.getFullYear(), nowDate.getMonth(), nowDate.getDate(), hh, mm).getTime();
+      return (now - entryMs) < BLOCK_WINDOW_MS && (now - entryMs) > 0;
+    });
+
+  if(recentEntry){
+    const lastTime = recentEntry.out || recentEntry.in;
+    const minFa = Math.round((now - (() => {
+      const [hh,mm] = lastTime.split(':').map(Number);
+      const d = new Date();
+      return new Date(d.getFullYear(), d.getMonth(), d.getDate(), hh, mm).getTime();
+    })()) / 60000);
+    showOverlay(nome,
+      'Già timbrato ' + minFa + ' min fa (alle ' + lastTime + '). Timbratura ignorata per sicurezza.',
+      'error'
+    );
+    return;
+  }
+
+  // --- Blocco 3: terza timbratura oggi (entrata + uscita già presenti) ---
+  // Chiede conferma prima di registrare una nuova entrata
+  const todayEntries = log.filter(r => r.date === today && r.matricola === matricola);
+  const hasComplete = todayEntries.some(r => r.in && r.out);
+  const hasOpenEntry = todayEntries.find(r => r.in && !r.out);
+
+  if(hasComplete && !hasOpenEntry){
+    const conferma = confirm(
+      nome + ' ha già una timbratura completa (entrata + uscita) oggi.\n\n' +
+      'Vuoi registrare una nuova ENTRATA aggiuntiva?\n' +
+      '(Premi Annulla se è una scansione accidentale)'
+    );
+    if(!conferma) return;
+  }
+
   lastScan = {matricola, time: now};
 
-  // 1) Salvataggio LOCALE immediato — l'app risponde subito, senza aspettare internet
-  const today = todayStr();
-  let entry = log.find(r => r.date===today && r.matricola===matricola && !r.out);
+  // --- Registrazione ---
+  let entry = hasOpenEntry;
   let type, time, entryId;
   if(entry){
     entry.out = nowStr();
@@ -520,7 +658,7 @@ async function registerScan(matricola){
   renderRecent();
   showOverlay(nome, (type==='out'?'Uscita':'Entrata') + ' registrata alle ' + time, type);
 
-  // 2) Sincronizzazione in BACKGROUND con Google Sheets, senza bloccare l'interfaccia
+  // Sincronizzazione in BACKGROUND con Google Sheets
   const url = getSheetsUrl();
   if(!url) return;
   postToSheet('scan', {matricola}).then(async (res)=>{
@@ -672,14 +810,47 @@ document.getElementById('btnAddEmp').addEventListener('click', async ()=>{
 });
 
 let editingIdx = null;
+let sortCol = 'date';
+let sortDir = 'desc';
+
+function updateSortHeaders(){
+  const cols = ['date','nome','in','out'];
+  cols.forEach(c=>{
+    const icon = document.getElementById('sort-'+c);
+    const th = icon ? icon.closest('th') : null;
+    if(!icon || !th) return;
+    if(c === sortCol){
+      icon.textContent = sortDir === 'asc' ? '▲' : '▼';
+      th.classList.toggle('sort-asc', sortDir === 'asc');
+      th.classList.toggle('sort-desc', sortDir === 'desc');
+    } else {
+      icon.textContent = '⇅';
+      th.classList.remove('sort-asc','sort-desc');
+    }
+  });
+}
+
+function sortRows(rows){
+  return rows.slice().sort((a,b)=>{
+    let va, vb;
+    if(sortCol === 'date') { va = a.date+(a.in||''); vb = b.date+(b.in||''); }
+    else if(sortCol === 'nome') { va = a.nome||''; vb = b.nome||''; }
+    else if(sortCol === 'in')  { va = a.date+(a.in||''); vb = b.date+(b.in||''); }
+    else if(sortCol === 'out') { va = a.date+(a.out||''); vb = b.date+(b.out||''); }
+    const cmp = va.localeCompare(vb);
+    return sortDir === 'asc' ? cmp : -cmp;
+  });
+}
 
 function renderLog(){
   const filterDate = document.getElementById('filterDate').value;
   const tbody = document.querySelector('#logTable tbody');
   const summaryEl = document.getElementById('logSummary');
   tbody.innerHTML='';
-  let rows = log.map((r,i)=>({...r, idx:i})).sort((a,b)=> (b.date+b.in).localeCompare(a.date+a.in));
+  let rows = log.map((r,i)=>({...r, idx:i}));
   if(filterDate) rows = rows.filter(r=>r.date===filterDate);
+  rows = sortRows(rows);
+  updateSortHeaders();
 
   const uniqueEmp = new Set(rows.map(r=>r.matricola)).size;
   if(filterDate){
@@ -694,22 +865,31 @@ function renderLog(){
   }
   rows.forEach(r=>{
     const tr = document.createElement('tr');
+    const isPending = r._pending || (pendingQueue && pendingQueue.some(p=>p.tempId===r.id));
+    const isLocal = !!(r.id && String(r.id).startsWith('local-'));
+    let syncBadge;
+    if(isLocal && isPending)       syncBadge = '<span class="sync-badge local">📱 Locale</span>';
+    else if(isPending)             syncBadge = '<span class="sync-badge syncing">⏳ In coda</span>';
+    else if(getSheetsUrl())        syncBadge = '<span class="sync-badge cloud">☁️ Cloud</span>';
+    else                           syncBadge = '<span class="sync-badge local">📱 Locale</span>';
+
     if(r.idx === editingIdx){
-      tr.innerHTML = '<td>'+r.nome+'</td><td>'+r.matricola+'</td><td>'+fmtDate(r.date)+'</td>'
+      tr.innerHTML = '<td>'+r.nome+'</td>'
         +'<td><input type="time" id="editIn" value="'+(r.in||'')+'" style="margin:0;padding:6px;font-size:13px;"></td>'
         +'<td><input type="time" id="editOut" value="'+(r.out||'')+'" style="margin:0;padding:6px;font-size:13px;"></td>'
+        +'<td>'+syncBadge+'</td>'
         +'<td style="white-space:nowrap;"><button class="delBtn" id="saveEditBtn" style="color:var(--accent);border-color:var(--accent);" data-idx="'+r.idx+'">Salva</button> '
         +'<button class="delBtn" id="cancelEditBtn">Annulla</button></td>';
     } else {
       tr.innerHTML = '<td>'+r.nome
-        +(r.manual ? ' <span class="status pending" style="font-size:10px;padding:2px 6px;">manuale</span>' : '')+'</td>'
-        +'<td>'+r.matricola+'</td><td>'+fmtDate(r.date)+'</td>'
+        +(r.manual ? ' <span class="status pending" style="font-size:10px;padding:2px 6px;">manuale</span>' : '')+'</td><td>'+r.matricola+'</td><td>'+fmtDate(r.date)+'</td>'
         +'<td>'+(r.in
           ? '<span class="status in">'+r.in+' <span class="clearX" data-clear="in" data-idx="'+r.idx+'" title="Cancella entrata">&times;</span></span>'
           : '<span class="status pending">-</span>')+'</td>'
         +'<td>'+(r.out
           ? '<span class="status out">'+r.out+' <span class="clearX" data-clear="out" data-idx="'+r.idx+'" title="Cancella uscita">&times;</span></span>'
           : '<span class="status pending">in corso</span>')+'</td>'
+        +'<td>'+syncBadge+'</td>'
         +'<td style="white-space:nowrap;"><button class="delBtn" data-edit="'+r.idx+'">Modifica</button> '
         +'<button class="delBtn" data-idx="'+r.idx+'">Elimina</button></td>';
     }
@@ -837,6 +1017,19 @@ function renderMissing(){
 }
 document.getElementById('missingDate').addEventListener('change', renderMissing);
 document.getElementById('filterDate').addEventListener('change', renderLog);
+
+document.querySelectorAll('th.sortable').forEach(th=>{
+  th.addEventListener('click', ()=>{
+    const col = th.dataset.col;
+    if(sortCol === col){
+      sortDir = sortDir === 'asc' ? 'desc' : 'asc';
+    } else {
+      sortCol = col;
+      sortDir = col === 'nome' ? 'asc' : 'desc';
+    }
+    renderLog();
+  });
+});
 
 function renderRecent(){
   const el = document.getElementById('recentList');
@@ -1066,11 +1259,7 @@ document.getElementById('btnTestUrl').addEventListener('click', async ()=>{
 </script>
 
 <script>
-if ('serviceWorker' in navigator) {
-  window.addEventListener('load', () => {
-    navigator.serviceWorker.register('./service-worker.js').catch(() => {});
-  });
-}
+if("serviceWorker" in navigator){window.addEventListener("load",()=>{navigator.serviceWorker.register("./service-worker.js").catch(()=>{});});}
 </script>
 </body>
 </html>
