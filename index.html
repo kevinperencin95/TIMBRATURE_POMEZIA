@@ -658,15 +658,21 @@ async function registerScan(matricola){
   renderRecent();
   showOverlay(nome, (type==='out'?'Uscita':'Entrata') + ' registrata alle ' + time, type);
 
-  // Sincronizzazione in BACKGROUND con Google Sheets
+  // Sincronizzazione in BACKGROUND con Google Sheets.
+  // Passiamo l'orario registrato localmente così lo script Google usa
+  // i valori reali della scansione, NON l'orario del server al momento
+  // della ricezione. Fondamentale per le timbrature offline.
   const url = getSheetsUrl();
   if(!url) return;
-  postToSheet('scan', {matricola}).then(async (res)=>{
+  const scanPayload = type === 'out'
+    ? {matricola, outTime: time, date: today}
+    : {matricola, inTime: time, date: today};
+  postToSheet('scan', scanPayload).then(async (res)=>{
     if(res.ok){
       await fetchFromSheet();
       renderLog(); renderRecent();
     } else {
-      pendingQueue.push({action:'scan', payload:{matricola}, tempId: entryId});
+      pendingQueue.push({action:'scan', payload: scanPayload, tempId: entryId});
       saveLocalCache();
     }
   });
